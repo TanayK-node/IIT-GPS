@@ -7,7 +7,7 @@ import geopandas as gpd
 # 1. CONFIGURATION
 # ==========================================
 GPS_FILE = '../data/matched_output (3).csv'
-CHECKPOINT_FILE = './data/checkpoints.csv'
+CHECKPOINT_FILE = './data/Checkpoints.csv'
 MAP_FILE = '../map/IITB_Auto_POV_Shapefile.gpkg'
 DRIVER_NAME = 'Balkrishna Dawre'
 RADIUS_METERS = 50
