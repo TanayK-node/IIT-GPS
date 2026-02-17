@@ -390,7 +390,7 @@ def run_pipeline():
                 0
             )
             
-            matched_df['status'] = np.where(matched_df['speed'] < STATIONARY_THRESHOLD_MPS, 'stationary', 'moving')
+            #matched_df['status'] = np.where(matched_df['speed'] < STATIONARY_THRESHOLD_MPS, 'stationary', 'moving')
 
             # --- FINAL OUTPUT FORMATTING ---
             final_output = matched_df[[
@@ -399,18 +399,16 @@ def run_pipeline():
                 'Matched_Lat', 'Matched_Lon', 
                 'accuracy', 
                 'dt', 'ds', 'speed', 
-                'Distance_Diff_m',
-                'status'
+                'Distance_Diff_m'
             ]].copy()
             
             final_output.columns = [
-                'data', 'ist time', 'driver id', 'drivername', 
+                'date', 'ist time', 'driver id', 'drivername', 
                 'original lat', 'original lon', 
                 'mapmatched lat', 'mapmatched lon', 
                 'accuracy', 
                 'dt', 'ds', 'speed', 
-                'distnaece bw raw an og point',
-                'status'
+                'distnaece bw raw an og point'
             ]
             
             base_name = os.path.basename(file_path)
