@@ -1,18 +1,19 @@
 # ============================================================
-# IITB AUTO ROUTE OPTIMIZATION V3 (FINAL FULL VERSION)
-# 7-DAY DEMAND + BACKBONE + CONNECTED ROUTES
-# + INTERACTIVE MAP + EXCEL DRIVER OUTPUT
+# IITB AUTO ROUTE OPTIMIZATION V3 (FINAL FIXED VERSION)
+# FIXED: METRIC CRS + STRICT BUFFERING + ACCURATE STATS
 # ============================================================
 
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 import networkx as nx
-from shapely.geometry import Point, LineString
-from scipy.spatial import cKDTree
 import glob
 import folium
 import warnings
+from shapely.geometry import Point, LineString
+from shapely.ops import unary_union
+from scipy.spatial import cKDTree
+
 warnings.filterwarnings("ignore")
 
 # ============================================================
@@ -21,7 +22,9 @@ warnings.filterwarnings("ignore")
 
 GPS_FOLDER = "./data/"     # Folder with 7 CSV files
 TOTAL_DRIVERS = 60
-EDGE_PERCENTILE = 65       # Top 30% demand edges covered
+EDGE_PERCENTILE = 65       # Top demand edges covered
+BUFFER_DISTANCE = 20       # 20 meters tolerance
+PROJECT_CRS = "EPSG:32643" # UTM Zone 43N (Meters)
 
 # ============================================================
 # 1. LOAD ROAD + CHECKPOINT DATA
@@ -29,9 +32,12 @@ EDGE_PERCENTILE = 65       # Top 30% demand edges covered
 
 print("Loading roads and checkpoints...")
 
+# Load Roads & Convert to Meters immediately
 roads = gpd.read_file("../map/IITB_Auto_POV_Shapefile.gpkg")
-checkpoints = pd.read_csv("Checkpoints.csv")
+roads = roads.to_crs(PROJECT_CRS)
 
+# Load Checkpoints
+checkpoints = pd.read_csv("Checkpoints.csv")
 checkpoints.columns = checkpoints.columns.str.strip()
 
 # ============================================================
@@ -49,6 +55,7 @@ for _, row in roads.iterrows():
     if geom is None or geom.geom_type != "LineString":
         continue
 
+    # Simplify geometry to edges
     coords = list(geom.coords)
     for i in range(len(coords)-1):
         x1,y1 = coords[i]
@@ -66,12 +73,13 @@ checkpoints['geometry'] = checkpoints.apply(
     lambda r: Point(r['Lon'], r['Lat']), axis=1
 )
 
+# Load as WGS84 then convert to Meters
 checkpoints_gdf = gpd.GeoDataFrame(
     checkpoints, geometry='geometry', crs="EPSG:4326"
 )
+checkpoints_gdf = checkpoints_gdf.to_crs(PROJECT_CRS)
 
-checkpoints_gdf = checkpoints_gdf.to_crs(roads.crs)
-
+# Snap checkpoints to graph nodes
 graph_nodes = np.array(list(G.nodes))
 graph_tree = cKDTree(graph_nodes)
 
@@ -105,164 +113,82 @@ gps_data = pd.concat(gps_list, ignore_index=True)
 print("Total GPS rows:", len(gps_data))
 
 # ============================================================
-# 5. PROCESS GPS  (FIXED VERSION – NO DATA LOSS)
+# 5. PROCESS GPS
 # ============================================================
 
 print("\n========== GPS PROCESSING ==========")
-print("After concat:", len(gps_data))
 
-# ------------------------------------------------------------
-# Ensure coordinates are numeric
-# ------------------------------------------------------------
-gps_data['mapmatched lat'] = pd.to_numeric(
-    gps_data['mapmatched lat'], errors='coerce'
-)
-
-gps_data['mapmatched lon'] = pd.to_numeric(
-    gps_data['mapmatched lon'], errors='coerce'
-)
-
-# Drop ONLY rows where coordinates are truly missing
+# Coordinate Cleaning
+gps_data['mapmatched lat'] = pd.to_numeric(gps_data['mapmatched lat'], errors='coerce')
+gps_data['mapmatched lon'] = pd.to_numeric(gps_data['mapmatched lon'], errors='coerce')
 gps_data = gps_data.dropna(subset=['mapmatched lat','mapmatched lon'])
 
-print("After coordinate cleaning:", len(gps_data))
-
-# ------------------------------------------------------------
-# Create geometry
-# ------------------------------------------------------------
+# Geometry Creation (WGS84 -> Metric)
 gps_data['geometry'] = gps_data.apply(
     lambda r: Point(r['mapmatched lon'], r['mapmatched lat']),
     axis=1
 )
 
-gps_gdf = gpd.GeoDataFrame(
-    gps_data,
-    geometry='geometry',
-    crs="EPSG:4326"
-)
+gps_gdf = gpd.GeoDataFrame(gps_data, geometry='geometry', crs="EPSG:4326")
+gps_gdf = gps_gdf.to_crs(PROJECT_CRS) # Force Metric CRS
 
-print("After GeoDataFrame creation:", len(gps_gdf))
-
-# ------------------------------------------------------------
-# Convert CRS
-# ------------------------------------------------------------
-gps_gdf = gps_gdf.to_crs(roads.crs)
-
-print("After CRS transform:", len(gps_gdf))
-
-# ------------------------------------------------------------
-# Timestamp Parsing (SAFE + EXPLICIT FORMAT)
-# ------------------------------------------------------------
-print(gps_data[['date','ist time']].head(20))
-
-# NEW CODE (Fix)
+# Timestamp Parsing
 gps_gdf['timestamp'] = pd.to_datetime(
     gps_gdf['date'].astype(str) + " " + gps_gdf['ist time'].astype(str),
-    # Removed the strict format argument
-    dayfirst=True,   # Helps resolve ambiguity (e.g. 02-07 vs 07-02)
+    dayfirst=True,
     errors='coerce'
 )
-nat_count = gps_gdf['timestamp'].isna().sum()
-
-print("NaT timestamps:", nat_count)
-print("Rows BEFORE dropping invalid timestamps:", len(gps_gdf))
-
-# ------------------------------------------------------------
-# Drop ONLY if actually invalid
-# ------------------------------------------------------------
-if nat_count > 0:
-    gps_gdf = gps_gdf.dropna(subset=['timestamp'])
-    print("Rows AFTER dropping invalid timestamps:", len(gps_gdf))
-else:
-    print("No timestamp drops required.")
-
-# ------------------------------------------------------------
-# Sort + Hour extraction
-# ------------------------------------------------------------
+gps_gdf = gps_gdf.dropna(subset=['timestamp'])
 gps_gdf = gps_gdf.sort_values(['driver id','timestamp'])
-
 gps_gdf['hour'] = gps_gdf['timestamp'].dt.hour
 
-print("Final GPS rows after processing:", len(gps_gdf))
-
-# ------------------------------------------------------------
-# Snap to Graph
-# ------------------------------------------------------------
+# Snap for demand calculation (Graph Traversal only)
 gps_gdf['graph_node'] = gps_gdf.apply(
     lambda r: snap_node(r.geometry.x, r.geometry.y),
     axis=1
 )
 
-print("GPS processing complete.")
-print("====================================\n")
+print("GPS processing complete. Rows:", len(gps_gdf))
 
-   
 # ============================================================
-# 6. COMPUTE EDGE DEMAND (WEEK AGGREGATED)
+# 6. COMPUTE EDGE DEMAND (Raw Graph Association)
 # ============================================================
 
 print("Computing edge demand...")
 
 for driver, df in gps_gdf.groupby('driver id'):
-
     nodes = df['graph_node'].tolist()
-
     for i in range(len(nodes)-1):
         try:
             path = nx.shortest_path(G, nodes[i], nodes[i+1], weight='weight')
-
             for j in range(len(path)-1):
-                u = path[j]
-                v = path[j+1]
+                u, v = path[j], path[j+1]
                 if G.has_edge(u,v):
                     G[u][v]['demand'] += 1
-
         except:
             continue
 
 print("Edge demand complete.")
 
 # ============================================================
-# 7. DEFINE BACKBONE
+# 7. DEFINE ROUTES
 # ============================================================
 
-mg_node = checkpoints_gdf[
-    checkpoints_gdf['Checkpoint']=='Main Gate'
-]['nearest_node'].values[0]
+print("Constructing Routes...")
 
-h12_node = checkpoints_gdf[
-    checkpoints_gdf['Checkpoint']=='Main road-h12'
-]['nearest_node'].values[0]
-
+# Backbone
+mg_node = checkpoints_gdf[checkpoints_gdf['Checkpoint']=='Main Gate']['nearest_node'].values[0]
+h12_node = checkpoints_gdf[checkpoints_gdf['Checkpoint']=='Main road-h12']['nearest_node'].values[0]
 backbone_path = nx.shortest_path(G, mg_node, h12_node, weight='weight')
+backbone_edges = set((backbone_path[i], backbone_path[i+1]) for i in range(len(backbone_path)-1))
 
-backbone_edges = set(
-    (backbone_path[i], backbone_path[i+1])
-    for i in range(len(backbone_path)-1)
-)
-
-print("Backbone created.")
-
-# ============================================================
-# 8. HIGH DEMAND EDGES
-# ============================================================
-
+# High Demand
 edge_demands = [G[u][v]['demand'] for u,v in G.edges()]
 threshold = np.percentile(edge_demands, EDGE_PERCENTILE)
+high_edges = set((u,v) for u,v in G.edges() if G[u][v]['demand'] >= threshold)
 
-high_edges = set(
-    (u,v) for u,v in G.edges()
-    if G[u][v]['demand'] >= threshold
-)
-
-print("High demand edges selected.")
-
-# ============================================================
-# 9. BUILD ROUTES
-# ============================================================
-
+# Route 1 construction
 route1_edges = backbone_edges.copy()
-
 for u,v in high_edges:
     if u in backbone_path or v in backbone_path:
         route1_edges.add((u,v))
@@ -271,13 +197,13 @@ route1_nodes = set()
 for u,v in route1_edges:
     route1_nodes.update([u,v])
 
+# Routes 2 & 3
 remaining_edges = high_edges - route1_edges
 remaining_nodes = set()
 for u,v in remaining_edges:
     remaining_nodes.update([u,v])
 
 remaining_graph = G.subgraph(remaining_nodes)
-
 components = list(nx.connected_components(remaining_graph))
 
 routes = {}
@@ -295,242 +221,143 @@ else:
 print("Routes constructed.")
 
 # ============================================================
-# 10. DRIVER ALLOCATION (AVERAGE PER HOUR)
+# 8. SPATIAL COVERAGE (STRICT BUFFER)
 # ============================================================
 
-cp_coords = np.array(
-    list(zip(checkpoints_gdf.geometry.x,
-             checkpoints_gdf.geometry.y))
-)
+print("\n========== CALCULATING SPATIAL COVERAGE ==========")
+print(f"Using buffer distance: {BUFFER_DISTANCE} meters")
 
-cp_tree = cKDTree(cp_coords)
-
-gps_coords = np.array(
-    list(zip(gps_gdf.geometry.x,
-             gps_gdf.geometry.y))
-)
-
-_, idx = cp_tree.query(gps_coords, k=1)
-
-gps_gdf['assigned_checkpoint'] = checkpoints_gdf.iloc[idx]['Checkpoint'].values
-
-cp_route_map = {}
-
+# Build precise route geometries
+route_buffers = {}
 for r_id, nodes in routes.items():
-    for node in nodes:
-        match = checkpoints_gdf[
-            checkpoints_gdf['nearest_node']==node
-        ]
-        if len(match)>0:
-            cp_route_map[match['Checkpoint'].values[0]] = r_id
+    subG = G.subgraph(nodes)
+    lines = []
+    for u, v in subG.edges():
+        lines.append(LineString([u, v]))
+    
+    if lines:
+        # Create metric buffer
+        route_buffers[r_id] = unary_union(lines).buffer(BUFFER_DISTANCE)
+    else:
+        route_buffers[r_id] = None
 
-gps_gdf['route'] = gps_gdf['assigned_checkpoint'].map(cp_route_map)
+# Strict assignment
+def assign_spatial(point):
+    for r_id, buffer in route_buffers.items():
+        if buffer and buffer.contains(point):
+            return r_id
+    return np.nan # Use NaN for easy counting
 
-hourly = gps_gdf.groupby(['hour','route']).size().reset_index(name='demand')
+gps_gdf['spatial_route'] = gps_gdf.geometry.apply(assign_spatial)
 
-hourly['avg_demand'] = hourly['demand'] / 7
-hourly['total_hour'] = hourly.groupby('hour')['avg_demand'].transform('sum')
+# Correct Statistics
+total = len(gps_gdf)
+counts = gps_gdf['spatial_route'].value_counts(dropna=False)
+uncovered = gps_gdf['spatial_route'].isna().sum()
+
+print(f"Total GPS points: {total}")
+for r_id in routes.keys():
+    c = counts.get(r_id, 0)
+    print(f"Route {r_id+1}: {c} ({(c/total)*100:.2f}%)")
+
+print(f"Uncovered: {uncovered} ({(uncovered/total)*100:.2f}%)")
+
+
+# ============================================================
+# 9. DRIVER ALLOCATION
+# ============================================================
+
+print("\n========== DRIVER ALLOCATION ==========")
+
+covered_gps = gps_gdf.dropna(subset=['spatial_route'])
+print(f"Allocating for {len(covered_gps)} covered points...")
+
+hourly = covered_gps.groupby(['hour', 'spatial_route']).size().reset_index(name='demand')
+hourly['total_hour'] = hourly.groupby('hour')['demand'].transform('sum')
 
 hourly['allocated_drivers'] = (
     TOTAL_DRIVERS *
-    hourly['avg_demand'] /
+    hourly['demand'] /
     hourly['total_hour']
 ).round()
 
-hourly[['hour','route','avg_demand','allocated_drivers']].to_excel(
-    "iitb_driver_allocation.xlsx", index=False
+hourly[['hour', 'spatial_route', 'demand', 'allocated_drivers']].to_excel(
+    "iitb_driver_allocation_spatial.xlsx", index=False
 )
-
-print("Excel saved: iitb_driver_allocation.xlsx")
-
-# ============================================================
-# ROUTE COVERAGE STATISTICS
-# ============================================================
-
-print("\n========== ROUTE COVERAGE STATS ==========")
-
-# Collect route nodes
-route_node_sets = {
-    r_id: set(nodes)
-    for r_id, nodes in routes.items()
-}
-
-# Map checkpoint -> route
-checkpoint_route_map = {}
-
-for r_id, node_set in route_node_sets.items():
-    for node in node_set:
-        matches = checkpoints_gdf[
-            checkpoints_gdf['nearest_node'] == node
-        ]
-        for cp in matches['Checkpoint']:
-            checkpoint_route_map[cp] = r_id
-
-# Compute stats
-total_checkpoints = len(checkpoints_gdf)
-
-route_counts = {}
-for r_id in routes.keys():
-    route_counts[r_id] = list(checkpoint_route_map.values()).count(r_id)
-
-covered_checkpoints = set(checkpoint_route_map.keys())
-all_checkpoints = set(checkpoints_gdf['Checkpoint'])
-
-uncovered_checkpoints = all_checkpoints - covered_checkpoints
-
-# Print stats
-print(f"Total checkpoints: {total_checkpoints}\n")
-
-for r_id in routes.keys():
-    print(f"Route {r_id+1} checkpoint count: {route_counts[r_id]}")
-
-print(f"\nUncovered checkpoints: {len(uncovered_checkpoints)}")
-
-if len(uncovered_checkpoints) > 0:
-    print("\nList of uncovered checkpoints:")
-    for cp in uncovered_checkpoints:
-        print("-", cp)
-
-print("\n===========================================")
-# ============================================================
-# SIMPLE GPS POINT COVERAGE STATS (7-DAY REAL DATA)
-# ============================================================
-
-print("\n========== GPS POINT COVERAGE ==========")
-
-# Convert route node lists to sets
-route_node_sets = {
-    r_id: set(nodes)
-    for r_id, nodes in routes.items()
-}
-
-# Assign each GPS point to route if its graph node is in route
-def assign_route(node):
-    for r_id, node_set in route_node_sets.items():
-        if node in node_set:
-            return r_id
-    return None
-
-gps_gdf['route_assigned'] = gps_gdf['graph_node'].apply(assign_route)
-
-total_points = len(gps_gdf)
-
-route_counts = gps_gdf['route_assigned'].value_counts(dropna=False)
-
-print(f"Total GPS points (7 days): {total_points}\n")
-
-for r_id in routes.keys():
-    count = route_counts.get(r_id, 0)
-    percent = (count / total_points) * 100
-    print(f"Route {r_id} points: {count} ({percent:.2f}%)")
-
-uncovered = route_counts.get(None, 0)
-uncovered_percent = (uncovered / total_points) * 100
-
-print(f"\nUncovered GPS points: {uncovered} ({uncovered_percent:.2f}%)")
-
-print("========================================")
+print("Saved: iitb_driver_allocation_spatial.xlsx")
 
 # ============================================================
-# VISUALIZE REAL GPS (ALL FILES) + ROUTES
+# 10. VISUALIZATION (FIXED)
 # ============================================================
 
-print("Creating full GPS visualization (real data)...")
+print("\nCreating Visualization...")
 
-from folium.plugins import MarkerCluster
-
-# Convert everything to WGS84
-roads_wgs = roads.to_crs(epsg=4326)
-checkpoints_wgs = checkpoints_gdf.to_crs(epsg=4326)
+# Back to WGS84 for Folium
 gps_wgs = gps_gdf.to_crs(epsg=4326)
+checkpoints_wgs = checkpoints_gdf.to_crs(epsg=4326)
 
-# Center map
-center = [
-    checkpoints_wgs.geometry.y.mean(),
-    checkpoints_wgs.geometry.x.mean()
-]
-
+center = [checkpoints_wgs.geometry.y.mean(), checkpoints_wgs.geometry.x.mean()]
 m = folium.Map(location=center, zoom_start=15)
 
-route_colors = {
-    0: "red",
-    1: "blue",
-    2: "green"
-}
+route_colors = {0: "red", 1: "blue", 2: "green"}
 
-# -----------------------------
-# DRAW ROUTES
-# -----------------------------
-for route_id, route_nodes in routes.items():
-
-    subG = G.subgraph(route_nodes)
-    full_path = []
-
-    for comp in nx.connected_components(subG):
-        comp = list(comp)
-        for i in range(len(comp)-1):
-            try:
-                path = nx.shortest_path(G, comp[i], comp[i+1], weight='weight')
-                full_path.extend(path)
-            except:
-                continue
-
-    if len(full_path) < 2:
+# ------------------------------------------------------------
+# DRAW ROUTES (FIXED LOGIC)
+# ------------------------------------------------------------
+for r_id, nodes in routes.items():
+    subG = G.subgraph(nodes)
+    
+    # Collect all edges as individual LineStrings
+    edge_geoms = []
+    for u, v in subG.edges():
+        edge_geoms.append(LineString([u, v]))
+    
+    if not edge_geoms: 
         continue
-
-    route_line = gpd.GeoDataFrame(
-        geometry=[LineString(full_path)],
-        crs=roads.crs
+    
+    # Create a GeoDataFrame of all edges in this route
+    # This handles the projection and branching correctly
+    route_edges_gdf = gpd.GeoDataFrame(
+        geometry=edge_geoms, 
+        crs=PROJECT_CRS
     ).to_crs(epsg=4326)
+    
+    # Plot each edge
+    # (We iterate because a branched route is multiple lines, not just one)
+    for _, row in route_edges_gdf.iterrows():
+        coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
+        
+        folium.PolyLine(
+            coords, 
+            color=route_colors.get(r_id, "gray"), 
+            weight=5, 
+            opacity=0.8
+        ).add_to(m)
 
-    coords_latlon = [(pt[1], pt[0]) for pt in route_line.geometry.iloc[0].coords]
+# ------------------------------------------------------------
+# DRAW GPS SAMPLE
+# ------------------------------------------------------------
+sample = gps_wgs.sample(min(5000, len(gps_wgs)))
 
-    folium.PolyLine(
-        coords_latlon,
-        color=route_colors.get(route_id, "gray"),
-        weight=6,
-        tooltip=f"Route {route_id+1}"
-    ).add_to(m)
-
-# -----------------------------
-# DRAW GPS POINTS (ALL REAL DATA)
-# -----------------------------
-
-marker_cluster = MarkerCluster().add_to(m)
-
-for _, row in gps_wgs.iterrows():
-
-    route_id = row.get("route_assigned")
-
-    if pd.isna(route_id):
-        color = "black"  # Uncovered
+for _, row in sample.iterrows():
+    r = row['spatial_route']
+    
+    # Color logic
+    if pd.isna(r):
+        color = "black"
+        opacity = 0.3
     else:
-        color = route_colors.get(route_id, "gray")
-
+        color = route_colors.get(r, "black")
+        opacity = 0.6
+    
     folium.CircleMarker(
-        location=[row.geometry.y, row.geometry.x],
-        radius=2,
-        color=color,
+        [row.geometry.y, row.geometry.x], 
+        radius=2, 
+        color=color, 
         fill=True,
-        fill_opacity=0.7
-    ).add_to(marker_cluster)
-
-# -----------------------------
-# DRAW CHECKPOINTS
-# -----------------------------
-for _, row in checkpoints_wgs.iterrows():
-    folium.CircleMarker(
-        location=[row.geometry.y, row.geometry.x],
-        radius=5,
-        color="white",
-        fill=True,
-        fill_opacity=1,
-        popup=row['Checkpoint']
+        fill_opacity=opacity
     ).add_to(m)
 
-m.save("iitb_routes_with_real_gps_v3.html")
-
-print("Map saved as: iitb_routes_with_real_gps_v3.html")
-
-print("All Done.")
-
+m.save("iitb_routes_spatial_final.html")
+print("Map saved: iitb_routes_spatial_final.html")
+print("Done.")
